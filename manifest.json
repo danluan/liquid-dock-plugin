@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "id": "danluan.dock",
+  "name": "Liquid Dock",
+  "version": "1.0.0",
+  "author": "Daniel Luan",
+  "description": "macOS Tahoe-style glass dock: intellihide, magnification, pinned and running apps",
+  "kinds": [
+    "service"
+  ],
+  "entryPoints": {
+    "service": "Dock.qml"
+  },
+  "omarchy": {
+    "clonedFrom": "omarchy.dock"
+  }
+}
