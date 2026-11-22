@@ -62,6 +62,7 @@ QtObject {
   readonly property int radiusSlot:  14
 
   // ── Spacing (4px scale)
+  readonly property int screenGap: 16     // dock -> bottom edge of the screen
   readonly property int dockPadding: 8
   readonly property int dockGap: 8
   readonly property int popupPadding: 8

@@ -39,7 +39,7 @@ PanelWindow {
   readonly property int topPad: tk.dockPadding + (tk.slotSize - tk.iconSize) / 2   // 12
   readonly property int dotZone: tk.dockPadding + (tk.slotSize - tk.iconSize) / 2  // 12
   readonly property int restH: topPad + iconSize + dotZone            // fixed height: hover never resizes the dock
-  readonly property int gap: 8                      // between pill and screen edge
+  readonly property int gap: tk.screenGap           // between pill and screen edge
   readonly property int radius: tk.radiusDock
   // immediate neighbours grow only slightly
   readonly property real falloffRadius: baseW * 1.6
