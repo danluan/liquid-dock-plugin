@@ -30,6 +30,7 @@ Hovering an app with open windows shows live thumbnails of each window (Quickshe
 | `showTrash` | `true` | trash button |
 | `indicators` | `true` | running/focused dots under the icons |
 | `reduceTransparency` | `false` | fully opaque surfaces |
+| `titleRules` | `[]` | `[{ "match": "<regex>", "app": "<desktop id>" }]`: a window whose title matches goes to that app, e.g. `{ "match": "^[·✢✳✶✻✽] ", "app": "claude-code" }` groups Claude Code sessions running in a regular terminal under their own icon |
 
 Colors, radii, sizes and timings live in `DockTokens.qml`.
 

@@ -28,6 +28,9 @@ Item {
   //   showTrash:  trash button (default true)
   //   indicators: running/focused dots under icons (default true)
   //   reduceTransparency: fully opaque surfaces (default false)
+  //   titleRules: [{ match: "<regex>", app: "<desktop id>" }] — a window whose
+  //               title matches goes to that app (e.g. a CLI running inside a
+  //               terminal that marks its title); first match wins
   readonly property string settingsPath: Quickshell.env("HOME") + "/.config/omarchy/danluan-dock.json"
   readonly property var defaultPins: ["brave-browser", "org.gnome.Nautilus", "foot", "com.microsoft.VSCode", "spotify", "obsidian"]
   property var settings: ({})
@@ -89,6 +92,30 @@ Item {
     return out
   }
 
+  // Title rules: compiled once per settings change.
+  readonly property var titleRules: {
+    var list = Array.isArray(settings.titleRules) ? settings.titleRules : []
+    var out = []
+    for (var i = 0; i < list.length; i++) {
+      var rule = list[i]
+      if (!rule || !rule.match || !rule.app) continue
+      try { out.push({ re: new RegExp(String(rule.match)), app: String(rule.app) }) }
+      catch (e) { console.warn("danluan.dock: invalid titleRules regex: " + rule.match) }
+    }
+    return out
+  }
+
+  function entryForTitle(title) {
+    if (root.titleRules.length === 0 || !title) return null
+    for (var i = 0; i < root.titleRules.length; i++) {
+      if (root.titleRules[i].re.test(title)) {
+        var entry = DesktopEntries.byId(root.titleRules[i].app)
+        if (entry) return entry
+      }
+    }
+    return null
+  }
+
   function entryForAppId(appId) {
     var entry = DesktopEntries.heuristicLookup(appId)
     if (entry) return entry
@@ -109,7 +136,7 @@ Item {
     for (var i = 0; i < toplevels.length; i++) {
       var toplevel = toplevels[i].wayland
       if (!toplevel || !toplevel.appId || toplevel.parent) continue
-      var entry = root.entryForAppId(toplevel.appId)
+      var entry = root.entryForTitle(String(toplevel.title || "")) || root.entryForAppId(toplevel.appId)
       var workspace = toplevels[i].workspace
       windows.push({
         key: entry ? entry.id : toplevel.appId,
