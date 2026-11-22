@@ -21,7 +21,7 @@ PanelWindow {
 
   // ------------------------------------------------------------ geometry
   readonly property int iconSize: 48
-  readonly property real maxMag: 1.5
+  readonly property real maxMag: 1.85               // macOS-like peak size under the pointer
   readonly property int pad: 10
   readonly property int slotGap: 10                 // extra width beside each icon
   readonly property int baseW: iconSize + slotGap
@@ -31,11 +31,18 @@ PanelWindow {
   readonly property int restH: topPad + iconSize + dotZone
   readonly property int gap: 8                      // between pill and screen edge
   readonly property int radius: 24
-  readonly property real falloffRadius: 150
+  readonly property real falloffRadius: baseW * 2.75 // how far the wave reaches on each side
+  readonly property int dragThreshold: 6
+  readonly property int removeDistance: 70          // drag this far above the pill to remove
 
   readonly property int appCount: dock ? dock.itemModel.count : 0
-  readonly property int slotCount: appCount + 2     // apps, launchpad, trash
-  readonly property real restW: pad * 2 + slotCount * baseW + sepW
+  // An app dragged in from the app grid opens a gap where it would land.
+  readonly property int appSlots: appCount + (insertIndex >= 0 && dragFrom < 0 ? 1 : 0)
+  // Separator position in slot units; animated so the dock widens smoothly.
+  property real sepPos: appSlots
+  Behavior on sepPos { NumberAnimation { duration: Style.duration(220); easing.type: Easing.OutCubic } }
+  readonly property real restW: pad * 2 + (sepPos + 2) * baseW + sepW
+  readonly property real restLeft: (width - restW) / 2
 
   // ------------------------------------------------------------ state
   readonly property int fullscreenMode: {
@@ -81,59 +88,191 @@ PanelWindow {
     return false
   }
 
-  readonly property bool tucked: dock && dock.intellihide && overlapped && !(revealed || menuOpen || gridOpen)
+  readonly property bool tucked: dock && dock.intellihide && overlapped && !(revealed || menuOpen || gridOpen || dragging)
   readonly property bool contentShown: shown && !tucked
+
+  // ------------------------------------------------------------ pointer
   property bool pointerIn: false
   property real pointerX: 0
-  // 0..1: magnification fades in and out as the pointer enters and leaves.
-  property real amount: pointerIn && !menuOpen ? 1 : 0
-  Behavior on amount {
-    NumberAnimation { duration: Style.duration(140); easing.type: Easing.OutCubic }
-  }
-
+  property real pointerY: 0
   property Item hoverSlot: null
+  property Item pressSlot: null
+  property int pressButton: 0
+  property point pressPos: Qt.point(0, 0)
 
-  // ------------------------------------------------------------ magnification math
-  function modelCenter(i) {
-    var c = (window.width - restW) / 2 + pad + i * baseW + baseW / 2
-    if (i >= appCount) c += sepW
-    return c
+  // Internal reorder: the app at dragFrom is carried by the pointer and the
+  // others make room at dragTo.
+  property int dragFrom: -1
+  property int dragTo: -1
+  property string dragKey: ""
+  property point grabOffset: Qt.point(0, 0)   // pointer minus the grabbed icon's center
+  readonly property bool dragging: dragFrom >= 0
+  readonly property bool removing: dragging && pointerY < body.y - removeDistance
+                                   && !!dock && dock.isPinned(dragKey)
+  // External drag from the app grid: the slot index the app would land at.
+  property int insertIndex: -1
+
+  // The rendered pointer and magnification amount chase their targets every
+  // frame, so the wave follows the pointer smoothly instead of stepping with
+  // each motion event, and grows/shrinks in and out of the dock.
+  readonly property real amountTarget: ((pointerIn && !menuOpen && !removing) || insertIndex >= 0) ? 1 : 0
+  property real smoothX: 0
+  property real amount: 0
+
+  readonly property bool animating: Math.abs(smoothX - pointerX) > 0.05 || Math.abs(amount - amountTarget) > 0.0005
+
+  FrameAnimation {
+    running: window.animating && window.visible
+    onTriggered: window.step(frameTime)
   }
 
-  function magAt(i) {
-    var d = Math.abs(pointerX - modelCenter(i))
-    var f = d < falloffRadius ? (Math.cos(Math.PI * d / falloffRadius) + 1) / 2 : 0
+  function step(dt) {
+    if (Style.reduceMotion || dt <= 0 || dt > 0.25) {
+      smoothX = pointerX
+      amount = amountTarget
+      return
+    }
+    // Critically damped-ish exponential follow, frame-rate independent.
+    var kx = 1 - Math.exp(-dt / 0.045)
+    var ka = 1 - Math.exp(-dt / (amountTarget > amount ? 0.07 : 0.11))
+    smoothX += (pointerX - smoothX) * kx
+    amount += (amountTarget - amount) * ka
+    if (Math.abs(smoothX - pointerX) <= 0.05) smoothX = pointerX
+    if (Math.abs(amount - amountTarget) <= 0.0005) amount = amountTarget
+  }
+
+  // ------------------------------------------------------------ layout math
+  // Slots register themselves so the layout can sum their widths.
+  property var slots: []
+  function registerSlot(s) { slots = slots.concat([s]) }
+  function unregisterSlot(s) { slots = slots.filter(function(o) { return o !== s }) }
+
+  // Separator offset for a (possibly fractional, mid-animation) slot position.
+  function sepAdj(d) { return Math.max(0, Math.min(1, d - (sepPos - 1))) * sepW }
+
+  function restCenter(d) { return restLeft + pad + d * baseW + baseW / 2 + sepAdj(d) }
+
+  function magFor(d) {
+    var dist = Math.abs(smoothX - restCenter(d))
+    if (amount <= 0 || dist >= falloffRadius) return 1
+    var f = (Math.cos(Math.PI * dist / falloffRadius) + 1) / 2
     return 1 + (maxMag - 1) * amount * f
   }
 
-  function extraBefore(i) {
+  function extraBefore(d) {
     var s = 0
-    for (var j = 0; j < i; j++) s += (magAt(j) - 1) * iconSize
+    for (var i = 0; i < slots.length; i++) {
+      var o = slots[i]
+      if (o.disp < d - 0.01) s += o.extra
+    }
     return s
   }
 
   readonly property real totalExtra: {
-    pointerX; amount; slotCount; width
-    return extraBefore(slotCount)
+    var s = 0
+    for (var i = 0; i < slots.length; i++) s += slots[i].extra
+    return s
   }
-  readonly property real maxExtraH: {
-    pointerX; amount; slotCount; width
-    var m = 1
-    for (var i = 0; i < slotCount; i++) m = Math.max(m, magAt(i))
-    return (m - 1) * iconSize
+
+  function displayIndexOf(i) {
+    if (dragFrom >= 0 && dragTo >= 0) {
+      if (i === dragFrom) return dragTo
+      if (dragFrom < dragTo && i > dragFrom && i <= dragTo) return i - 1
+      if (dragTo < dragFrom && i >= dragTo && i < dragFrom) return i + 1
+      return i
+    }
+    if (insertIndex >= 0 && i >= insertIndex) return i + 1
+    return i
+  }
+
+  // Rest-layout slot index nearest to a window x, for drop targets.
+  function restIndexAt(x, count) {
+    var i = Math.round((x - restLeft - pad - baseW / 2) / baseW)
+    return Math.max(0, Math.min(count, i))
+  }
+
+  function slotAt(x) {
+    for (var i = 0; i < slots.length; i++) {
+      var s = slots[i]
+      if (s.dragGhosted || s.opacity < 0.5) continue
+      var l = body.x + s.x
+      if (x >= l && x < l + s.width) return s
+    }
+    return null
+  }
+
+  // ------------------------------------------------------------ pointer handling
+  function pointerMoved(x, y) {
+    if (!pointerIn || amount < 0.02) smoothX = x   // grow from where the pointer is, not where it left
+    pointerX = x
+    pointerY = y
+    if (pressSlot && !dragging && pressButton === Qt.LeftButton && pressSlot.appKey !== ""
+        && Math.hypot(x - pressPos.x, y - pressPos.y) > dragThreshold) {
+      dragKey = pressSlot.appKey
+      grabOffset = Qt.point(pressPos.x - (body.x + pressSlot.x + pressSlot.width / 2),
+                            pressPos.y - (body.y + pressSlot.iconTop + window.iconSize * pressSlot.mag / 2))
+      dragTo = pressSlot.modelIndex
+      dragFrom = pressSlot.modelIndex
+      closeMenu()
+    }
+    if (dragging) dragTo = restIndexAt(x, appCount - 1)
+    hoverSlot = dragging ? null : slotAt(x)
+  }
+
+  function pressAt(x, y, button) {
+    pointerMoved(x, y)
+    pressSlot = slotAt(x)
+    pressButton = button
+    pressPos = Qt.point(x, y)
+  }
+
+  function releaseAt(x, y, button) {
+    if (dragging) {
+      finishDrag()
+    } else if (pressSlot && button === pressButton && slotAt(x) === pressSlot) {
+      pressSlot.triggered(button)
+    }
+    pressSlot = null
+    pressButton = 0
+  }
+
+  function finishDrag() {
+    var from = dragFrom, to = dragTo, key = dragKey, remove = removing
+    if (remove) {
+      dragFrom = -1; dragTo = -1; dragKey = ""
+      dock.setPinned(key, false)
+    } else {
+      if (dock) dock.moveItem(from, to)     // the model moves first, so slots don't jump
+      dragFrom = -1; dragTo = -1; dragKey = ""
+    }
+    hoverSlot = slotAt(pointerX)
+    if (!pointerIn) hideTimer.restart()
+  }
+
+  function cancelDrag() {
+    dragFrom = -1; dragTo = -1; dragKey = ""
+    pressSlot = null
   }
 
   // ------------------------------------------------------------ external drag (app grid)
-  property int insertIndex: -1
+  // Coordinates are the grid panel's, which covers the screen.
   function moveExternalDrag(x, y) {
-    if (window.shown && !window.tucked) window.revealed = window.revealed
+    if (!window.shown) return
+    var wy = y - (screen.height - window.height)
+    var near = wy >= body.y - 70 && x >= body.x - 50 && x <= body.x + body.width + 50
+    if (!near) { insertIndex = -1; return }
+    revealed = true
+    if (insertIndex < 0) smoothX = x
+    pointerX = x
+    insertIndex = restIndexAt(x, appCount)
   }
   function dropExternalDrag(x, y, key) {
-    var top = screen.height - window.height
-    var inside = x >= body.x - 30 && x <= body.x + body.width + 30 && y - top >= body.y - 30
-    if (inside && key && window.dock) window.dock.pinAt(key, window.dock.itemModel.count)
+    if (insertIndex >= 0 && key && window.dock) window.dock.pinAt(key, insertIndex)
   }
-  function endExternalDrag() { insertIndex = -1 }
+  function endExternalDrag() {
+    insertIndex = -1
+    if (!pointerIn) hideTimer.restart()
+  }
 
   function openMenu(item, slot) {
     window.settingsMenu = false
@@ -152,7 +291,7 @@ PanelWindow {
     hideTimer.restart()
   }
 
-  onShownChanged: if (!shown) { closeMenu(); revealed = false }
+  onShownChanged: if (!shown) { closeMenu(); cancelDrag(); revealed = false }
 
   // ------------------------------------------------------------ surface
   visible: !remapGuard.remapping
@@ -216,8 +355,8 @@ PanelWindow {
 
   Timer {
     id: hideTimer
-    interval: 250
-    onTriggered: if (!window.pointerIn && !edgeHover.hovered && !window.menuOpen) window.revealed = false
+    interval: 350
+    onTriggered: if (!window.pointerIn && !edgeHover.hovered && !window.menuOpen && !window.dragging && window.insertIndex < 0) window.revealed = false
   }
 
   // Bottom-edge hot zone that brings a tucked dock back.
@@ -236,26 +375,36 @@ PanelWindow {
     }
   }
 
-  // Fixed footprint of the pill at full magnification: input mask and pointer tracking.
+  // Fixed footprint of the pill at full magnification: input mask and the one
+  // place all pointer input is handled (hover, click, drag).
   Item {
     id: hitBox
-    readonly property real extraW: (window.maxMag - 1) * window.iconSize * 2.6
+    readonly property real extraW: (window.maxMag - 1) * window.iconSize * 2.2
     width: window.restW + extraW
-    height: window.restH + (window.maxMag - 1) * window.iconSize
+    height: window.restH + (window.maxMag - 1) * window.iconSize + 6
     x: Math.round((window.width - width) / 2)
     y: window.height - window.gap - height
 
-    HoverHandler {
-      id: pointerHover
-      onHoveredChanged: {
-        window.pointerIn = hovered
-        if (hovered) window.revealed = true
+    MouseArea {
+      id: pointerArea
+      anchors.fill: parent
+      hoverEnabled: true
+      acceptedButtons: Qt.LeftButton | Qt.MiddleButton | Qt.RightButton
+      cursorShape: window.dragging ? Qt.ClosedHandCursor : (window.hoverSlot ? Qt.PointingHandCursor : Qt.ArrowCursor)
+
+      readonly property bool engaged: containsMouse || pressed
+      onEngagedChanged: {
+        window.pointerIn = engaged
+        if (engaged) window.revealed = true
         else {
           window.hoverSlot = null
           hideTimer.restart()
         }
       }
-      onPointChanged: window.pointerX = hitBox.x + point.position.x
+      onPositionChanged: function(mouse) { window.pointerMoved(hitBox.x + mouse.x, hitBox.y + mouse.y) }
+      onPressed: function(mouse) { window.pressAt(hitBox.x + mouse.x, hitBox.y + mouse.y, mouse.button) }
+      onReleased: function(mouse) { window.releaseAt(hitBox.x + mouse.x, hitBox.y + mouse.y, mouse.button) }
+      onCanceled: window.cancelDrag()
     }
   }
 
@@ -263,8 +412,8 @@ PanelWindow {
   Item {
     id: body
     width: window.restW + window.totalExtra
-    height: window.restH + window.maxExtraH
-    x: Math.round((window.width - width) / 2)
+    height: window.restH
+    x: (window.width - width) / 2
     property real tuck: window.tucked ? height + window.gap + 20 : 0
     y: window.height - window.gap - height + tuck
     opacity: window.shown ? 1 : 0
@@ -273,7 +422,7 @@ PanelWindow {
       id: tuckMotion
       enabled: window.shown
       NumberAnimation {
-        duration: Style.duration(tuckMotion.targetValue > 0 ? 120 : 180)
+        duration: Style.duration(tuckMotion.targetValue > 0 ? 160 : 220)
         easing.type: Easing.OutCubic
       }
     }
@@ -299,8 +448,9 @@ PanelWindow {
       }
     }
 
-    // Slots are laid out in body coordinates; each is placed from the model
-    // layout plus the shift magnification gives it.
+    // Slots are laid out in body coordinates from their (animated) display
+    // position plus the room magnification gives the slots before them.
+    // Icons grow upward out of the pill, like macOS.
     Item {
       id: slotLayer
       anchors.fill: parent
@@ -316,12 +466,12 @@ PanelWindow {
         width: 1
         height: window.iconSize * 0.7
         color: Qt.rgba(1, 1, 1, 0.22)
-        x: window.pad + window.appCount * window.baseW + window.extraBefore(window.appCount) + (window.sepW - 1) / 2
+        x: window.pad + window.sepPos * window.baseW + window.extraBefore(window.sepPos - 0.5) + (window.sepW - 1) / 2
         y: body.height - window.dotZone - window.iconSize + (window.iconSize - height) / 2
       }
 
-      AppsSlot { slotIndex: window.appCount }
-      TrashSlot { slotIndex: window.appCount + 1 }
+      AppsSlot { targetDisp: window.sepPos }
+      TrashSlot { targetDisp: window.sepPos + 1 }
     }
   }
 
@@ -329,20 +479,33 @@ PanelWindow {
   component Slot: Item {
     id: slot
 
-    property int slotIndex: 0
     property string label: ""
-    property real mag: window.magAt(slotIndex)
-    property bool hovered: mouse.containsMouse
-    property alias mouse: mouse
+    property string appKey: ""      // set for app slots: those can be dragged
+    property int modelIndex: -1
+    property real targetDisp: 0
+    property real disp: targetDisp
+    property bool animateDisp: true
+    Behavior on disp {
+      enabled: slot.animateDisp
+      NumberAnimation { duration: Style.duration(220); easing.type: Easing.OutCubic }
+    }
+    property bool dragGhosted: false
     property real lift: 0           // launch bounce, px
-    default property alias content: iconHolder.data
-
+    readonly property real mag: window.magFor(disp)
     readonly property real extra: (mag - 1) * window.iconSize
+    readonly property bool pressed: window.pressSlot === slot && !window.dragging
+    readonly property bool hovered: window.hoverSlot === slot
+    readonly property real iconTop: iconHolder.y
+    default property alias content: iconHolder.data
+    signal triggered(int button)
+
     width: window.baseW + extra
     height: body.height
-    x: window.pad + slotIndex * window.baseW + (slotIndex >= window.appCount ? window.sepW : 0)
-       + window.extraBefore(slotIndex)
+    x: window.pad + disp * window.baseW + window.sepAdj(disp) + window.extraBefore(disp)
     z: hovered ? 2 : 1
+
+    Component.onCompleted: window.registerSlot(slot)
+    Component.onDestruction: window.unregisterSlot(slot)
 
     // Icon box: bottom-aligned above the dot zone and growing upward.
     Item {
@@ -351,21 +514,8 @@ PanelWindow {
       height: width
       anchors.horizontalCenter: parent.horizontalCenter
       y: parent.height - window.dotZone - height - slot.lift
-    }
-
-    MouseArea {
-      id: mouse
-      anchors.horizontalCenter: parent.horizontalCenter
-      width: parent.width
-      y: iconHolder.y
-      height: parent.height - iconHolder.y
-      hoverEnabled: true
-      cursorShape: Qt.PointingHandCursor
-      acceptedButtons: Qt.LeftButton | Qt.MiddleButton | Qt.RightButton
-      onContainsMouseChanged: {
-        if (containsMouse) window.hoverSlot = slot
-        else if (window.hoverSlot === slot) window.hoverSlot = null
-      }
+      opacity: slot.dragGhosted ? 0 : (slot.pressed ? 0.7 : 1)
+      Behavior on opacity { NumberAnimation { duration: Style.duration(90) } }
     }
   }
 
@@ -376,6 +526,7 @@ PanelWindow {
     property string primary: ""
     property string iconName: ""
     property int attempt: 0
+    property bool active: true
     readonly property var candidates: {
       var out = []
       if (primary) out.push(primary)
@@ -394,7 +545,7 @@ PanelWindow {
     }
     readonly property string base2: "file:///usr/share/icons/"
     onCandidatesChanged: attempt = 0
-    source: candidates[Math.min(attempt, candidates.length - 1)]
+    source: active ? candidates[Math.min(attempt, candidates.length - 1)] : ""
     onStatusChanged: if (status === Image.Error && attempt < candidates.length - 1) attempt++
     sourceSize: Qt.size(128, 128)
     fillMode: Image.PreserveAspectFit
@@ -412,13 +563,21 @@ PanelWindow {
     readonly property bool launching: !!window.dock && window.dock.isLaunching(key)
     readonly property int windowCount: modelData ? modelData.windows.length : 0
     readonly property var entry: window.dock ? window.dock.entryFor(modelData) : null
-    slotIndex: index
+    appKey: key
+    modelIndex: index
+    targetDisp: window.displayIndexOf(index)
+    dragGhosted: window.dragFrom === index
     label: entry ? String(entry.name || key) : key
 
-    mouse.onClicked: function(event) {
-      if (event.button === Qt.RightButton) { window.openMenu(appSlot.modelData, appSlot); return }
+    // A new app fades in where it lands rather than popping.
+    opacity: 0
+    Component.onCompleted: opacity = 1
+    Behavior on opacity { NumberAnimation { duration: Style.duration(200); easing.type: Easing.OutCubic } }
+
+    onTriggered: function(button) {
+      if (button === Qt.RightButton) { window.openMenu(appSlot.modelData, appSlot); return }
       window.closeMenu()
-      if (event.button === Qt.MiddleButton) window.dock.launch(appSlot.modelData)
+      if (button === Qt.MiddleButton) window.dock.launch(appSlot.modelData)
       else window.dock.activate(appSlot.modelData)
     }
 
@@ -426,14 +585,11 @@ PanelWindow {
       anchors.fill: parent
       primary: window.dock && appSlot.modelData ? window.dock.iconFor(appSlot.modelData) : ""
       iconName: window.dock ? window.dock.iconNameFor(appSlot.modelData) : ""
-      opacity: appSlot.pressedFade
     }
-
-    property real pressedFade: mouse.pressed ? 0.75 : 1
 
     // Running indicator.
     Rectangle {
-      visible: appSlot.windowCount > 0
+      visible: appSlot.windowCount > 0 && !appSlot.dragGhosted
       width: 4; height: 4; radius: 2
       color: Qt.rgba(Commons.Color.foreground.r, Commons.Color.foreground.g, Commons.Color.foreground.b, 0.85)
       anchors.horizontalCenter: parent.horizontalCenter
@@ -455,9 +611,10 @@ PanelWindow {
   component AppsSlot: Slot {
     id: appsSlot
     label: Commons.I18n.t("dock.searchApps")
+    animateDisp: false              // follows sepPos, which is already animated
 
-    mouse.onClicked: function(event) {
-      if (event.button === Qt.RightButton) { window.openSettingsMenu(appsSlot); return }
+    onTriggered: function(button) {
+      if (button === Qt.RightButton) { window.openSettingsMenu(appsSlot); return }
       window.closeMenu()
       if (window.dock) window.dock.openApps()
     }
@@ -471,7 +628,6 @@ PanelWindow {
         GradientStop { position: 0.0; color: "#8e9aaf" }
         GradientStop { position: 1.0; color: "#4a5568" }
       }
-      opacity: mouse.pressed ? 0.8 : 1
 
       Grid {
         anchors.centerIn: parent
@@ -494,9 +650,10 @@ PanelWindow {
   component TrashSlot: Slot {
     id: trashSlot
     label: "Trash"
+    animateDisp: false
 
-    mouse.onClicked: function(event) {
-      if (event.button !== Qt.LeftButton) return
+    onTriggered: function(button) {
+      if (button !== Qt.LeftButton) return
       window.closeMenu()
       Util.execDetached("xdg-open trash:///")
     }
@@ -505,7 +662,31 @@ PanelWindow {
       anchors.fill: parent
       primary: window.dock ? window.dock.iconByName("user-trash") : ""
       iconName: "user-trash"
-      opacity: mouse.pressed ? 0.75 : 1
+    }
+  }
+
+  // ------------------------------------------------------------ drag ghost
+  // The app being reordered, under the pointer. Dragged well above the dock
+  // it fades: letting go there takes it out of the dock.
+  Item {
+    id: ghost
+    readonly property var item: window.dock && window.dragKey ? window.dock.itemFor(window.dragKey) : null
+    property real size: window.iconSize * (window.removing ? 1.1 : window.maxMag * 0.95)
+    visible: window.dragging && !!item
+    width: size
+    height: size
+    x: window.pointerX - window.grabOffset.x - width / 2
+    y: window.pointerY - window.grabOffset.y - height / 2
+    z: 10
+    opacity: window.removing ? 0.5 : 1
+    Behavior on opacity { NumberAnimation { duration: Style.duration(140); easing.type: Easing.OutCubic } }
+    Behavior on size { NumberAnimation { duration: Style.duration(140); easing.type: Easing.OutCubic } }
+
+    FallbackImage {
+      anchors.fill: parent
+      active: ghost.visible
+      primary: window.dock && ghost.item ? window.dock.iconFor(ghost.item) : ""
+      iconName: window.dock && ghost.item ? window.dock.iconNameFor(ghost.item) : ""
     }
   }
 
@@ -537,7 +718,11 @@ PanelWindow {
       var c = centerX
       return Math.max(8, Math.min(window.width - width - 8, Math.round(c - width / 2)))
     }
-    y: body.y - height - 8
+    // Sits just above the hovered icon, which grows out of the pill.
+    property real iconTop: body.y - 8
+    readonly property real liveTop: target ? body.y + target.y + target.iconTop : -1
+    onLiveTopChanged: if (liveTop >= 0) iconTop = liveTop
+    y: iconTop - height - 8
 
     Text {
       id: tipText
