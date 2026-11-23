@@ -1,4 +1,6 @@
 import QtQuick
+import QtQuick.Shapes
+import QtQuick.Effects
 import Quickshell
 import Quickshell.Hyprland
 import Quickshell.Wayland
@@ -20,18 +22,27 @@ PanelWindow {
   readonly property int workspaceId: workspace ? workspace.id : -1
 
   // ------------------------------------------------------------ geometry
-  readonly property int iconSize: 48
-  readonly property real maxMag: 1.85               // macOS-like peak size under the pointer
-  readonly property int pad: 10
-  readonly property int slotGap: 10                 // extra width beside each icon
-  readonly property int baseW: iconSize + slotGap
-  readonly property int sepW: 18
-  readonly property int topPad: 8
-  readonly property int dotZone: 14                 // room under the icon for the dot
-  readonly property int restH: topPad + iconSize + dotZone
-  readonly property int gap: 8                      // between pill and screen edge
-  readonly property int radius: 24
-  readonly property real falloffRadius: baseW * 2.75 // how far the wave reaches on each side
+  // Geometry comes from the design tokens (DockTokens.qml).
+  readonly property DockTokens tk: DockTokens {
+    material: window.dock ? window.dock.material : "liquid"
+    reduceTransparency: window.dock ? window.dock.reduceTransparency : false
+    indicators: window.dock ? window.dock.showIndicators : true
+  }
+  readonly property int iconSize: tk.iconSize                         // 40
+  readonly property real maxMag: tk.hoverScale                        // magnification is a transform only
+  readonly property int baseW: tk.slotSize + tk.dockGap - 2           // slot + gap
+  readonly property int slotGap: baseW - iconSize
+  readonly property int pad: tk.dockPadding - (baseW - tk.slotSize) / 2  // pill edge -> slot = dockPadding
+  // trailing slots (app grid, trash) are optional
+  readonly property int trailing: (dock && dock.showApps ? 1 : 0) + (dock && dock.showTrash ? 1 : 0)
+  readonly property int sepW: trailing > 0 ? 18 : 0
+  readonly property int topPad: tk.dockPadding + (tk.slotSize - tk.iconSize) / 2   // 12
+  readonly property int dotZone: tk.dockPadding + (tk.slotSize - tk.iconSize) / 2  // 12
+  readonly property int restH: topPad + iconSize + dotZone            // fixed height: hover never resizes the dock
+  readonly property int gap: tk.screenGap           // between pill and screen edge
+  readonly property int radius: tk.radiusDock
+  // immediate neighbours grow only slightly
+  readonly property real falloffRadius: baseW * 1.6
   readonly property int dragThreshold: 6
   readonly property int removeDistance: 70          // drag this far above the pill to remove
 
@@ -41,7 +52,7 @@ PanelWindow {
   // Separator position in slot units; animated so the dock widens smoothly.
   property real sepPos: appSlots
   Behavior on sepPos { NumberAnimation { duration: Style.duration(220); easing.type: Easing.OutCubic } }
-  readonly property real restW: pad * 2 + (sepPos + 2) * baseW + sepW
+  readonly property real restW: pad * 2 + (sepPos + trailing) * baseW + sepW
   readonly property real restLeft: (width - restW) / 2
 
   // ------------------------------------------------------------ state
@@ -96,6 +107,45 @@ PanelWindow {
   property real pointerX: 0
   property real pointerY: 0
   property Item hoverSlot: null
+
+  // ------------------------------------------------------------ window previews
+  // Hover an app with 1+ windows: live thumbnails of each, click to focus, × to close.
+  readonly property int previewMin: 1
+  property Item previewSlot: null
+  readonly property var previewItem: previewSlot && previewSlot.modelData ? previewSlot.modelData : null
+  readonly property bool previewOpen: previewItem !== null && previewItem.windows.length >= previewMin
+  property Item previewCandidate: null
+  // last slot with a preview: the popup stays there (with its content) while it fades out
+  property Item anchorSlot: null
+  onPreviewSlotChanged: if (previewSlot) anchorSlot = previewSlot
+  function slotWindows(slot) { return slot && slot.modelData ? slot.modelData.windows.length : 0 }
+  onHoverSlotChanged: {
+    if (hoverSlot && !dragging && !menuOpen && slotWindows(hoverSlot) >= previewMin) {
+      previewHideTimer.stop()
+      if (previewSlot) previewSlot = hoverSlot          // already open: switch right away
+      else { previewCandidate = hoverSlot; previewShowTimer.restart() }
+    } else {
+      previewShowTimer.stop()
+      if (previewSlot) previewHideTimer.restart()
+    }
+  }
+  onMenuOpenChanged: if (menuOpen) previewSlot = null
+  onDraggingChanged: if (dragging) previewSlot = null
+  Timer {
+    id: previewShowTimer
+    interval: window.tk.popupOpenDelay
+    onTriggered: if (window.hoverSlot === window.previewCandidate) window.previewSlot = window.previewCandidate
+  }
+  Timer {
+    id: previewHideTimer
+    interval: window.tk.popupCloseGrace
+    onTriggered: {
+      if (previewHover.hovered) return
+      if (window.hoverSlot && window.slotWindows(window.hoverSlot) >= window.previewMin) return
+      window.previewSlot = null
+      if (!window.pointerIn) hideTimer.restart()
+    }
+  }
   property Item pressSlot: null
   property int pressButton: 0
   property point pressPos: Qt.point(0, 0)
@@ -133,8 +183,8 @@ PanelWindow {
       return
     }
     // Critically damped-ish exponential follow, frame-rate independent.
-    var kx = 1 - Math.exp(-dt / 0.045)
-    var ka = 1 - Math.exp(-dt / (amountTarget > amount ? 0.07 : 0.11))
+    var kx = 1 - Math.exp(-dt / 0.022)
+    var ka = 1 - Math.exp(-dt / (amountTarget > amount ? 0.035 : 0.08))
     smoothX += (pointerX - smoothX) * kx
     amount += (amountTarget - amount) * ka
     if (Math.abs(smoothX - pointerX) <= 0.05) smoothX = pointerX
@@ -159,20 +209,9 @@ PanelWindow {
     return 1 + (maxMag - 1) * amount * f
   }
 
-  function extraBefore(d) {
-    var s = 0
-    for (var i = 0; i < slots.length; i++) {
-      var o = slots[i]
-      if (o.disp < d - 0.01) s += o.extra
-    }
-    return s
-  }
-
-  readonly property real totalExtra: {
-    var s = 0
-    for (var i = 0; i < slots.length; i++) s += slots[i].extra
-    return s
-  }
+  // Magnification is a transform only: the dock never changes size.
+  function extraBefore(d) { return 0 }
+  readonly property real totalExtra: 0
 
   function displayIndexOf(i) {
     if (dragFrom >= 0 && dragTo >= 0) {
@@ -194,7 +233,7 @@ PanelWindow {
   function slotAt(x) {
     for (var i = 0; i < slots.length; i++) {
       var s = slots[i]
-      if (s.dragGhosted || s.opacity < 0.5) continue
+      if (!s.visible || s.dragGhosted || s.opacity < 0.5) continue
       var l = body.x + s.x
       if (x >= l && x < l + s.width) return s
     }
@@ -304,12 +343,13 @@ PanelWindow {
 
   anchors { bottom: true; left: true; right: true }
   implicitWidth: 0
-  implicitHeight: gap + restH + 64 + Style.spacing.popupRowHeight * 5 + 40
+  implicitHeight: Math.max(gap + restH + 64 + Style.spacing.popupRowHeight * 5 + 40, gap + restH + 260)
 
   mask: Region {
     item: window.contentShown ? hitBox : null
     Region { item: window.shown && window.tucked ? edgeTrigger : null }
     Region { item: menu.visible ? menu : null }
+    Region { item: preview.visible ? preview : null }
   }
 
   ScreenMoveRemap { id: remapGuard; window: window }
@@ -356,7 +396,7 @@ PanelWindow {
   Timer {
     id: hideTimer
     interval: 350
-    onTriggered: if (!window.pointerIn && !edgeHover.hovered && !window.menuOpen && !window.dragging && window.insertIndex < 0) window.revealed = false
+    onTriggered: if (!window.pointerIn && !edgeHover.hovered && !window.menuOpen && !window.previewOpen && !window.dragging && window.insertIndex < 0) window.revealed = false
   }
 
   // Bottom-edge hot zone that brings a tucked dock back.
@@ -427,25 +467,13 @@ PanelWindow {
       }
     }
 
-    // Glass: translucent theme background, white rim, soft top highlight.
-    Rectangle {
+    // Dock surface (see DockTokens).
+    SolidSurface {
       id: glass
       anchors.fill: parent
       radius: window.radius
-      color: Qt.rgba(Commons.Color.background.r, Commons.Color.background.g, Commons.Color.background.b, 0.40)
-      border.width: 1
-      border.color: Qt.rgba(1, 1, 1, 0.18)
-
-      Rectangle {
-        anchors.fill: parent
-        anchors.margins: 1
-        radius: window.radius - 1
-        gradient: Gradient {
-          GradientStop { position: 0.0; color: Qt.rgba(1, 1, 1, 0.16) }
-          GradientStop { position: 0.45; color: Qt.rgba(1, 1, 1, 0.03) }
-          GradientStop { position: 1.0; color: Qt.rgba(1, 1, 1, 0.0) }
-        }
-      }
+      fill: window.tk.surfaceBase
+      shadows: window.tk.shadowDock
     }
 
     // Slots are laid out in body coordinates from their (animated) display
@@ -463,6 +491,7 @@ PanelWindow {
 
       Rectangle {
         id: separator
+        visible: window.trailing > 0
         width: 1
         height: window.iconSize * 0.7
         color: Qt.rgba(1, 1, 1, 0.22)
@@ -470,8 +499,9 @@ PanelWindow {
         y: body.height - window.dotZone - window.iconSize + (window.iconSize - height) / 2
       }
 
-      AppsSlot { targetDisp: window.sepPos }
-      TrashSlot { targetDisp: window.sepPos + 1 }
+      AppsSlot { visible: !!window.dock && window.dock.showApps; targetDisp: window.sepPos }
+      TrashSlot { visible: !!window.dock && window.dock.showTrash; targetDisp: window.sepPos + (window.dock && window.dock.showApps ? 1 : 0) }
+
     }
   }
 
@@ -499,7 +529,7 @@ PanelWindow {
     default property alias content: iconHolder.data
     signal triggered(int button)
 
-    width: window.baseW + extra
+    width: window.baseW
     height: body.height
     x: window.pad + disp * window.baseW + window.sepAdj(disp) + window.extraBefore(disp)
     z: hovered ? 2 : 1
@@ -507,15 +537,30 @@ PanelWindow {
     Component.onCompleted: window.registerSlot(slot)
     Component.onDestruction: window.unregisterSlot(slot)
 
-    // Icon box: bottom-aligned above the dot zone and growing upward.
+    // Slot background on hover/press (concentric with the dock radius).
+    Rectangle {
+      width: window.tk.slotSize
+      height: width
+      radius: window.tk.radiusSlot
+      anchors.horizontalCenter: parent.horizontalCenter
+      y: parent.height - window.dotZone - window.iconSize - (window.tk.slotSize - window.iconSize) / 2
+      color: slot.pressed ? window.tk.surfaceActive : (slot.hovered ? window.tk.surfaceHover : "transparent")
+      Behavior on color { ColorAnimation { duration: window.tk.durationFast } }
+    }
+
+    // Icon: fixed size; magnification and press are a scale from the bottom.
     Item {
       id: iconHolder
-      width: window.iconSize * slot.mag
+      width: window.iconSize
       height: width
       anchors.horizontalCenter: parent.horizontalCenter
       y: parent.height - window.dotZone - height - slot.lift
-      opacity: slot.dragGhosted ? 0 : (slot.pressed ? 0.7 : 1)
-      Behavior on opacity { NumberAnimation { duration: Style.duration(90) } }
+      transformOrigin: Item.Bottom
+      // magnification is already smoothed per frame (step()); only the press animates here
+      property real pressK: slot.pressed ? window.tk.pressScale : 1
+      Behavior on pressK { NumberAnimation { duration: 80; easing.type: Easing.OutCubic } }
+      scale: slot.mag * pressK
+      opacity: slot.dragGhosted ? 0 : 1
     }
   }
 
@@ -582,18 +627,36 @@ PanelWindow {
     }
 
     FallbackImage {
-      anchors.fill: parent
+      readonly property real optical: window.tk.roundIcons.indexOf(appSlot.key) >= 0 ? window.tk.roundIconScale : 1
+      anchors.centerIn: parent
+      width: parent.width * optical
+      height: width
       primary: window.dock && appSlot.modelData ? window.dock.iconFor(appSlot.modelData) : ""
       iconName: window.dock ? window.dock.iconNameFor(appSlot.modelData) : ""
     }
 
-    // Running indicator.
-    Rectangle {
-      visible: appSlot.windowCount > 0 && !appSlot.dragGhosted
-      width: 4; height: 4; radius: 2
-      color: Qt.rgba(Commons.Color.foreground.r, Commons.Color.foreground.g, Commons.Color.foreground.b, 0.85)
+    // State: dot = running · bar = focused · 2–3 dots = several windows.
+    readonly property bool focusedApp: {
+      var ws = appSlot.modelData ? appSlot.modelData.windows : []
+      for (var i = 0; i < ws.length; i++) if (ws[i].toplevel && ws[i].toplevel.activated) return true
+      return false
+    }
+    Row {
+      visible: window.tk.indicators && appSlot.windowCount > 0 && !appSlot.dragGhosted
       anchors.horizontalCenter: parent.horizontalCenter
-      y: parent.height - window.dotZone + 6
+      y: parent.height + 3            // parent is iconHolder: 3px under the icon
+      spacing: 3
+      Repeater {
+        model: appSlot.focusedApp ? 1 : Math.min(3, appSlot.windowCount)
+        delegate: Rectangle {
+          height: 3
+          width: appSlot.focusedApp ? 12 : 4
+          radius: 1.5
+          color: window.tk.accentA(appSlot.focusedApp ? 0.95 : 0.6)
+          Behavior on width { NumberAnimation { duration: window.tk.durationBase; easing.type: Easing.OutCubic } }
+          Behavior on color { ColorAnimation { duration: window.tk.durationBase } }
+        }
+      }
     }
 
     // Launch feedback: a small, steady hop. Ease-out only, no overshoot.
@@ -704,15 +767,15 @@ PanelWindow {
 
     }
     visible: opacity > 0.01
-    opacity: window.hoverSlot && window.contentShown && !window.menuOpen && text.length > 0 ? 1 : 0
+    opacity: window.hoverSlot && window.contentShown && !window.menuOpen && !window.previewOpen && text.length > 0 ? 1 : 0
     Behavior on opacity { NumberAnimation { duration: Style.duration(120); easing.type: Easing.OutCubic } }
 
-    width: tipText.implicitWidth + 20
-    height: tipText.implicitHeight + 10
-    radius: 9
-    color: Qt.rgba(Commons.Color.background.r, Commons.Color.background.g, Commons.Color.background.b, 0.55)
+    width: tipText.implicitWidth + 2 * window.tk.popupPadding + 4
+    height: tipText.implicitHeight + window.tk.popupPadding
+    radius: 8
+    color: window.tk.surfaceRaised
     border.width: 1
-    border.color: Qt.rgba(1, 1, 1, 0.18)
+    border.color: window.tk.borderSubtle
 
     x: {
       var c = centerX
@@ -722,16 +785,262 @@ PanelWindow {
     property real iconTop: body.y - 8
     readonly property real liveTop: target ? body.y + target.y + target.iconTop : -1
     onLiveTopChanged: if (liveTop >= 0) iconTop = liveTop
-    y: iconTop - height - 8
+    y: body.y - window.tk.popupOffset - height
 
     Text {
       id: tipText
       anchors.centerIn: parent
       textFormat: Text.PlainText
       text: tip.text
-      color: Commons.Color.foreground
-      font.family: Style.font.family
-      font.pixelSize: Style.font.body
+      color: window.tk.textPrimary
+      font.family: window.tk.fontUi
+      font.pixelSize: window.tk.fontSizeLabel
+      font.weight: window.tk.fontWeightLabel
+    }
+  }
+
+  // ------------------------------------------------------------ window previews
+  // Same material as the dock, tight padding, thumbnail filling the card,
+  // sans 12/500 title. Enters with fade + 4px + 0.98 scale; between icons it
+  // slides and swaps content without closing.
+  Item {
+    id: preview
+    // Stable list: the dock rebuilds its app objects on every Hyprland event
+    // (and every 800ms); recreating thumbnails on that made the preview flicker.
+    // Delegates only change when the SET of windows changes (by address).
+    readonly property var liveWins: window.anchorSlot && window.anchorSlot.modelData ? window.anchorSlot.modelData.windows : []
+    readonly property string winAddrs: liveWins.map(function(w) { return String(w.address) }).join(",")
+    property var addrs: []
+    onWinAddrsChanged: addrs = winAddrs === "" ? [] : winAddrs.split(",")
+    function winFor(addr) {
+      for (var i = 0; i < liveWins.length; i++) if (String(liveWins[i].address) === addr) return liveWins[i]
+      return null
+    }
+    readonly property bool on: window.previewOpen && window.contentShown
+    visible: opacity > 0.01
+    opacity: on ? 1 : 0
+    Behavior on opacity { NumberAnimation { duration: preview.on ? window.tk.durationBase : window.tk.durationFast; easing.type: Easing.OutCubic } }
+    scale: on ? 1 : 0.98
+    Behavior on scale { NumberAnimation { duration: window.tk.durationBase; easing.type: Easing.OutCubic } }
+    transformOrigin: Item.Bottom
+    transform: Translate {
+      y: preview.on ? 0 : 4
+      Behavior on y { NumberAnimation { duration: window.tk.durationBase; easing.type: Easing.OutCubic } }
+    }
+
+    width: Math.min(window.width - 2 * window.gap, cards.implicitWidth + 2 * window.tk.popupPadding)
+    height: cards.implicitHeight + 2 * window.tk.popupPadding
+    Behavior on width { enabled: preview.on && preview.opacity > 0.99; NumberAnimation { duration: window.tk.durationBase; easing.type: Easing.OutCubic } }
+    Behavior on height { enabled: preview.on && preview.opacity > 0.99; NumberAnimation { duration: window.tk.durationBase; easing.type: Easing.OutCubic } }
+    x: window.anchorSlot ? window.popupX(window.anchorSlot, preview) : 0
+    Behavior on x {
+      enabled: preview.on && preview.opacity > 0.99     // slide between apps only; when closing, just fade
+      NumberAnimation { duration: window.tk.durationBase; easing.type: Easing.OutCubic }
+    }
+    y: body.y - window.tk.popupOffset - height
+
+    // only react when the APP changes (by key, not by object)
+    property string shownKey: ""
+    readonly property string curKey: window.previewItem ? String(window.previewItem.key) : ""
+    onCurKeyChanged: {
+      if (curKey !== "" && shownKey !== "" && curKey !== shownKey && opacity > 0.99) swapFade.restart()
+      if (curKey !== "") shownKey = curKey
+    }
+    // app switch: no dimming; new thumbnails fade in on their own
+    SequentialAnimation { id: swapFade }
+
+    // aspect ratio per window (address), remembered across switches
+    property var aspects: ({})
+    function aspectOf(addr, win, src) {
+      if (src && src.width > 0 && src.height > 0) return src.height / src.width
+      if (aspects[addr] !== undefined) return aspects[addr]
+      if (win && win.size && win.size[0] > 0) return win.size[1] / win.size[0]
+      return 0.625
+    }
+
+    HoverHandler {
+      id: previewHover
+      onHoveredChanged: if (!hovered) previewHideTimer.restart(); else previewHideTimer.stop()
+    }
+
+    SolidSurface {
+      anchors.fill: parent
+      radius: window.tk.radiusPopup
+      fill: window.tk.surfaceRaised
+      shadows: window.tk.shadowPopup
+    }
+
+    Row {
+      id: cards
+      x: window.tk.popupPadding; y: window.tk.popupPadding
+      spacing: 8
+      Repeater {
+        model: preview.addrs
+        delegate: Item {
+          id: card
+          required property var modelData            // window address
+          readonly property var win: preview.winFor(modelData)
+          readonly property var tl: win ? win.toplevel : null
+          readonly property bool focusedWin: !!tl && tl.activated
+          // real window aspect ratio, height clamped
+          readonly property real aspect: preview.aspectOf(modelData, win, shot.sourceSize)
+          readonly property int thumbH: Math.round(Math.max(window.tk.thumbMinH, Math.min(window.tk.thumbMaxH, window.tk.thumbWidth * aspect)))
+          readonly property int thumbW: Math.round(Math.max(120, Math.min(window.tk.thumbWidth, thumbH / aspect)))
+          width: thumbW
+          height: thumbH + window.tk.popupGap + title.implicitHeight
+
+          HoverHandler { id: cardHover; cursorShape: Qt.PointingHandCursor }
+          TapHandler {
+            onTapped: {
+              if (window.dock && card.win) window.dock.bringForward(card.win)
+              window.previewSlot = null
+            }
+          }
+
+          // thumbnail with concentric corners (radiusThumb = radiusPopup − padding)
+          Item {
+            id: thumb
+            width: parent.width
+            height: card.thumbH
+            layer.enabled: true
+            layer.effect: MultiEffect {
+              maskEnabled: true
+              maskSource: thumbMask
+              maskThresholdMin: 0.5
+              maskSpreadAtMin: 1.0
+            }
+            Rectangle { anchors.fill: parent; color: window.tk.surfaceHover }
+            ScreencopyView {
+              id: shot
+              anchors.centerIn: parent
+              captureSource: preview.visible ? card.tl : null
+              live: preview.visible
+              constraintSize: Qt.size(thumb.width, thumb.height)
+              width: implicitWidth
+              height: implicitHeight
+              opacity: hasContent ? 1 : 0
+              Behavior on opacity { NumberAnimation { duration: window.tk.durationFast; easing.type: Easing.OutCubic } }
+              onSourceSizeChanged: if (sourceSize.width > 0) preview.aspects[card.modelData] = sourceSize.height / sourceSize.width
+            }
+            // no frame after 350ms (minimized): big centered app icon
+            Timer { id: noShot; interval: 350; running: !shot.hasContent }
+            FallbackImage {
+              anchors.centerIn: parent
+              width: 56; height: 56
+              visible: !shot.hasContent && !noShot.running
+              active: visible
+              primary: window.dock && window.previewItem ? window.dock.iconFor(window.previewItem) : ""
+            }
+          }
+          Item {
+            id: thumbMask
+            width: thumb.width; height: thumb.height
+            visible: false
+            layer.enabled: true
+            Rectangle { anchors.fill: parent; radius: window.tk.radiusThumb; color: "black" }
+          }
+          // 1px inner border (accent 0.5 on the focused window)
+          Rectangle {
+            width: thumb.width; height: thumb.height
+            radius: window.tk.radiusThumb
+            color: "transparent"
+            border.width: 1
+            border.color: card.focusedWin ? window.tk.accentA(0.5)
+              : (cardHover.hovered ? Qt.rgba(1, 1, 1, 0.18) : window.tk.borderSubtle)
+            Behavior on border.color { ColorAnimation { duration: window.tk.durationFast } }
+          }
+
+          Text {
+            id: title
+            y: card.thumbH + window.tk.popupGap
+            width: parent.width
+            text: card.tl ? String(card.tl.title || "") : ""
+            elide: Text.ElideRight
+            horizontalAlignment: Text.AlignLeft
+            color: window.tk.textPrimary
+            font.family: window.tk.fontUi
+            font.pixelSize: window.tk.fontSizeLabel
+            font.weight: window.tk.fontWeightLabel
+            textFormat: Text.PlainText
+          }
+
+          // close this window
+          Rectangle {
+            width: 20; height: 20; radius: 10
+            x: thumb.width - width - 6; y: 6
+            visible: cardHover.hovered
+            color: closeHover.hovered ? "#FF5F57" : window.tk.surfaceRaised
+            border.width: 1
+            border.color: window.tk.borderSubtle
+            Text {
+              anchors.centerIn: parent
+              text: "×"
+              color: window.tk.textPrimary
+              font.family: window.tk.fontUi
+              font.pixelSize: 14
+            }
+            HoverHandler { id: closeHover; cursorShape: Qt.PointingHandCursor }
+            TapHandler { onTapped: if (card.tl) card.tl.close() }
+          }
+        }
+      }
+    }
+  }
+
+  // Surface shared by the dock, popup and tooltip:
+  // fill + specular rim + inner top glow + shadows.
+  component SolidSurface: Item {
+    id: ss
+    property real radius: 14
+    property color fill: "black"
+    property var shadows: []
+    Repeater {
+      model: ss.shadows
+      delegate: RectangularShadow {
+        required property var modelData
+        anchors.fill: ss
+        radius: ss.radius
+        offset.y: modelData.y
+        blur: modelData.blur
+        color: Qt.rgba(0, 0, 0, modelData.alpha)
+      }
+    }
+    // glass body: tint + a thread of dark for contrast
+    Rectangle {
+      anchors.fill: parent
+      radius: ss.radius
+      color: ss.fill
+      Behavior on color { ColorAnimation { duration: window.tk.durationBase } }
+      Rectangle { anchors.fill: parent; radius: parent.radius; color: window.tk.surfaceTint }
+    }
+    // inner light from the top (and a faint reflection at the bottom)
+    Rectangle {
+      anchors.fill: parent
+      anchors.margins: 1
+      radius: ss.radius - 1
+      gradient: Gradient {
+        GradientStop { position: 0.0; color: Qt.rgba(1, 1, 1, window.tk.sheen) }
+        GradientStop { position: 0.42; color: "transparent" }
+        GradientStop { position: 0.85; color: "transparent" }
+        GradientStop { position: 1.0; color: window.tk.liquid ? Qt.rgba(1, 1, 1, 0.05) : window.tk.borderInnerDark }
+      }
+    }
+    // specular rim: 1px ring with a vertical gradient
+    Shape {
+      anchors.fill: parent
+      preferredRendererType: Shape.CurveRenderer
+      ShapePath {
+        strokeWidth: -1
+        fillRule: ShapePath.OddEvenFill
+        fillGradient: LinearGradient {
+          x1: 0; y1: 0; x2: 0; y2: ss.height
+          GradientStop { position: 0.0; color: window.tk.rimTop }
+          GradientStop { position: 0.5; color: window.tk.rimMid }
+          GradientStop { position: 1.0; color: window.tk.rimBottom }
+        }
+        PathRectangle { x: 0; y: 0; width: ss.width; height: ss.height; radius: ss.radius }
+        PathRectangle { x: 1; y: 1; width: ss.width - 2; height: ss.height - 2; radius: Math.max(0, ss.radius - 1) }
+      }
     }
   }
 
